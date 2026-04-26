@@ -1,28 +1,22 @@
 """
-Wakacje Monitor — scraper wielu serwisów
-Obsługuje: wakacje.pl, itaka.pl, tui.pl, neckermann.pl, coraltravel.pl, rainbow.pl
+Wakacje Monitor — Scraper v2
+Używa bezpośrednich zapytań HTTP do API serwisów zamiast Playwright.
 """
 
 import requests
-import json
-import time
-import random
 import logging
-from datetime import datetime, date
-from dataclasses import dataclass, asdict
+from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field
 from typing import Optional
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+import urllib3
+urllib3.disable_warnings()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-# ─── Konfiguracja ────────────────────────────────────────────────────────────
 
 CRITERIA = {
     "destination": "Marsa Alam",
     "date_from": date(2025, 5, 25),
-    "date_to": date(2025, 6, 11),
+    "date_to":   date(2025, 6, 11),
     "nights_min": 7,
     "nights_max": 10,
     "adults": 3,
@@ -32,669 +26,383 @@ CRITERIA = {
 }
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html,*/*",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-
-# ─── Model danych ─────────────────────────────────────────────────────────────
 
 @dataclass
 class Offer:
-    source: str           # nazwa serwisu
-    hotel_name: str
-    destination: str
-    date_from: str
-    date_to: str
+    hotel: str
+    source: str
+    stars: int
+    rating: float
     nights: int
-    adults: int
-    children: int
-    board: str            # AI, HB, BB, FB
-    price_total: float    # cena za wszystkich
-    price_per_person: float
-    rating: Optional[float]
-    stars: Optional[int]
-    has_aquapark: bool
+    board: str
+    price_total: float
     url: str
-    scraped_at: str = ""
+    departure_date: str
+    amenities: list = field(default_factory=list)
 
-    def __post_init__(self):
-        if not self.scraped_at:
-            self.scraped_at = datetime.now().isoformat()
-
-    def matches_criteria(self) -> bool:
-        c = CRITERIA
-        ok = (
-            self.nights >= c["nights_min"]
-            and self.nights <= c["nights_max"]
-            and self.has_aquapark
-            and (self.rating is None or self.rating >= c["min_rating"])
-        )
-        return ok
-
-    def unique_key(self) -> str:
-        return f"{self.hotel_name}_{self.date_from}_{self.nights}_{self.price_total}"
+    def key(self):
+        return f"{self.source}:{self.hotel}:{self.departure_date}:{self.nights}"
 
 
-# ─── Pomocnicze ───────────────────────────────────────────────────────────────
-
-def sleep_random(min_s=2, max_s=5):
-    time.sleep(random.uniform(min_s, max_s))
-
-
-def get_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
+def generate_date_range():
+    """Generuje wszystkie możliwe daty wylotu w oknie."""
+    dates = []
+    current = CRITERIA["date_from"]
+    while current <= CRITERIA["date_to"] - timedelta(days=CRITERIA["nights_min"]):
+        dates.append(current)
+        current += timedelta(days=1)
+    return dates
 
 
-def detect_aquapark(text: str) -> bool:
-    keywords = ["aquapark", "aqua park", "water park", "waterpark", "zjeżdżalnia", "basen ze zjeżdżalnią"]
-    text_lower = text.lower()
-    return any(k in text_lower for k in keywords)
+def scrape_wakacje_pl() -> list[Offer]:
+    """Scraper wakacje.pl — API JSON."""
+    offers = []
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
 
-
-# ─── Scraper bazowy ───────────────────────────────────────────────────────────
-
-class BaseScraper:
-    name = "base"
-
-    def scrape(self) -> list[Offer]:
-        raise NotImplementedError
-
-    def safe_scrape(self) -> list[Offer]:
-        try:
-            log.info(f"[{self.name}] Startowanie...")
-            offers = self.scrape()
-            log.info(f"[{self.name}] Znaleziono {len(offers)} ofert")
-            return offers
-        except Exception as e:
-            log.error(f"[{self.name}] Błąd: {e}")
-            return []
-
-
-# ─── Wakacje.pl ───────────────────────────────────────────────────────────────
-
-class WakacjePLScraper(BaseScraper):
-    name = "wakacje.pl"
-
-    def scrape(self) -> list[Offer]:
-        offers = []
-        c = CRITERIA
-
-        # Wakacje.pl używa API JSON — odpytujemy je bezpośrednio
-        url = (
-            "https://www.wakacje.pl/wczasy/"
-            f"?destination=marsa-alam"
-            f"&dateFrom={c['date_from'].strftime('%Y-%m-%d')}"
-            f"&dateTo={c['date_to'].strftime('%Y-%m-%d')}"
-            f"&adults={c['adults']}"
-            f"&children=1"
-            f"&childrenAges={c['child_age']}"
-            f"&nightsFrom={c['nights_min']}"
-            f"&nightsTo={c['nights_max']}"
-            f"&attributes=aquapark"
-        )
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(extra_http_headers=HEADERS)
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            sleep_random(3, 6)
-
-            # Czekamy na załadowanie ofert
-            try:
-                page.wait_for_selector("[data-testid='offer-card'], .offer-card, article.offer", timeout=15000)
-            except Exception:
-                log.warning(f"[{self.name}] Brak selektora ofert — próba parsowania HTML")
-
-            html = page.content()
-            browser.close()
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Szukamy kart ofert (różne możliwe selektory wakacje.pl)
-        cards = (
-            soup.select("[data-testid='offer-card']")
-            or soup.select(".offer-card")
-            or soup.select("article.offer")
-            or soup.select(".hotel-offer")
-        )
-
-        for card in cards:
-            try:
-                name = (
-                    card.select_one("[data-testid='hotel-name'], .hotel-name, h2, h3")
-                    or card.find(class_=lambda c: c and "name" in c)
+        for dep_date in generate_date_range():
+            for nights in range(CRITERIA["nights_min"], CRITERIA["nights_max"] + 1):
+                url = (
+                    "https://www.wakacje.pl/wczasy/egipt/marsa-alam/"
+                    f"?adults={CRITERIA['adults']}"
+                    f"&children=1&childAge={CRITERIA['child_age']}"
+                    f"&dateFrom={dep_date.strftime('%Y-%m-%d')}"
+                    f"&nights={nights}"
                 )
-                name = name.get_text(strip=True) if name else "Nieznany hotel"
-
-                price_el = card.select_one(
-                    "[data-testid='price'], .price, .offer-price, [class*='price']"
+                # Próba API endpoint
+                api_url = (
+                    "https://www.wakacje.pl/api/v3/offers/search"
+                    f"?destination=marsa-alam"
+                    f"&adults={CRITERIA['adults']}"
+                    f"&children=1&childAge[]={CRITERIA['child_age']}"
+                    f"&dateFrom={dep_date.strftime('%Y-%m-%d')}"
+                    f"&nights={nights}"
+                    f"&amenities[]=aquapark"
+                    f"&ratingMin={CRITERIA['min_rating']}"
+                    f"&page=1&perPage=50"
                 )
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = float("".join(filter(str.isdigit, price_text)) or 0)
+                try:
+                    r = session.get(api_url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = data.get("offers", data.get("results", data.get("data", [])))
+                        for item in items:
+                            rating = float(item.get("rating", item.get("score", 0)) or 0)
+                            if rating < CRITERIA["min_rating"]:
+                                continue
+                            amenities = [a.get("name", a) if isinstance(a, dict) else str(a)
+                                        for a in item.get("amenities", item.get("facilities", []))]
+                            has_aquapark = any("aqua" in str(a).lower() or "park" in str(a).lower()
+                                             for a in amenities)
+                            if not has_aquapark:
+                                continue
+                            price = float(item.get("price", item.get("pricePerPerson", 0)) or 0)
+                            if price > 0 and price < 5000:
+                                price = price * (CRITERIA["adults"] + 1)
+                            offers.append(Offer(
+                                hotel=item.get("hotelName", item.get("name", "Nieznany")),
+                                source="wakacje.pl",
+                                stars=int(item.get("stars", item.get("hotelStars", 0)) or 0),
+                                rating=rating,
+                                nights=nights,
+                                board=item.get("board", item.get("boardType", "?")),
+                                price_total=price,
+                                url=item.get("url", item.get("offerUrl", url)),
+                                departure_date=dep_date.strftime("%Y-%m-%d"),
+                                amenities=amenities,
+                            ))
+                except Exception:
+                    pass
+        log.info(f"[wakacje.pl] Znaleziono {len(offers)} ofert")
+    except Exception as e:
+        log.error(f"[wakacje.pl] Błąd: {e}")
+    return offers
 
-                nights_el = card.select_one("[data-testid='nights'], [class*='night'], [class*='noc']")
-                nights_text = nights_el.get_text(strip=True) if nights_el else ""
-                nights = int("".join(filter(str.isdigit, nights_text)) or c["nights_min"])
 
-                rating_el = card.select_one("[data-testid='rating'], .rating, [class*='rating'], [class*='ocena']")
-                rating = None
-                if rating_el:
-                    try:
-                        rating = float(rating_el.get_text(strip=True).replace(",", "."))
-                    except ValueError:
-                        pass
+def scrape_itaka() -> list[Offer]:
+    """Scraper itaka.pl — API JSON."""
+    offers = []
+    try:
+        session = requests.Session()
+        session.headers.update({**HEADERS, "X-Requested-With": "XMLHttpRequest"})
 
-                card_text = card.get_text()
-                has_aqua = detect_aquapark(card_text)
-
-                link_el = card.select_one("a[href]")
-                offer_url = link_el["href"] if link_el else url
-                if offer_url.startswith("/"):
-                    offer_url = "https://www.wakacje.pl" + offer_url
-
-                board = "AI"
-                for b_key, b_val in [("All Inclusive", "AI"), ("Half Board", "HB"), ("Bed & Breakfast", "BB"), ("Full Board", "FB")]:
-                    if b_key.lower() in card_text.lower():
-                        board = b_val
-                        break
-
-                o = Offer(
-                    source=self.name,
-                    hotel_name=name,
-                    destination="Marsa Alam",
-                    date_from=c["date_from"].strftime("%Y-%m-%d"),
-                    date_to=c["date_to"].strftime("%Y-%m-%d"),
-                    nights=nights,
-                    adults=c["adults"],
-                    children=1,
-                    board=board,
-                    price_total=price,
-                    price_per_person=round(price / (c["adults"] + 1), 2) if price else 0,
-                    rating=rating,
-                    stars=None,
-                    has_aquapark=has_aqua,
-                    url=offer_url,
+        for dep_date in generate_date_range():
+            for nights in range(CRITERIA["nights_min"], CRITERIA["nights_max"] + 1):
+                api_url = (
+                    "https://www.itaka.pl/api/search/offers"
+                    f"?departureDate={dep_date.strftime('%Y-%m-%d')}"
+                    f"&returnDate={(dep_date + timedelta(days=nights)).strftime('%Y-%m-%d')}"
+                    f"&adults={CRITERIA['adults']}"
+                    f"&children={CRITERIA['child_age']}"
+                    f"&destination[]=EGMA"  # kod Marsa Alam
+                    f"&amenity[]=aquapark"
+                    f"&minRating={CRITERIA['min_rating']}"
+                    f"&page=1&size=50"
                 )
-                offers.append(o)
-            except Exception as e:
-                log.debug(f"[{self.name}] Błąd parsowania karty: {e}")
+                try:
+                    r = session.get(api_url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = (data.get("offers") or data.get("results") or
+                                data.get("data", {}).get("offers", []))
+                        for item in items:
+                            rating = float(item.get("rating", item.get("hotelRating", 0)) or 0)
+                            if rating < CRITERIA["min_rating"]:
+                                continue
+                            price = float(item.get("price", item.get("totalPrice", 0)) or 0)
+                            if price > 0 and price < 5000:
+                                price *= (CRITERIA["adults"] + 1)
+                            offers.append(Offer(
+                                hotel=item.get("hotelName", item.get("name", "Nieznany")),
+                                source="itaka.pl",
+                                stars=int(item.get("stars", item.get("hotelCategory", 0)) or 0),
+                                rating=rating,
+                                nights=nights,
+                                board=item.get("board", item.get("mealType", "?")),
+                                price_total=price,
+                                url="https://www.itaka.pl" + item.get("url", item.get("offerUrl", "")),
+                                departure_date=dep_date.strftime("%Y-%m-%d"),
+                            ))
+                except Exception:
+                    pass
+        log.info(f"[itaka.pl] Znaleziono {len(offers)} ofert")
+    except Exception as e:
+        log.error(f"[itaka.pl] Błąd: {e}")
+    return offers
 
-        return [o for o in offers if o.matches_criteria()]
 
+def scrape_tui() -> list[Offer]:
+    """Scraper TUI.pl — API JSON."""
+    offers = []
+    try:
+        session = requests.Session()
+        session.headers.update({**HEADERS, "Accept": "application/json"})
 
-# ─── Itaka.pl ─────────────────────────────────────────────────────────────────
-
-class ItakaScraper(BaseScraper):
-    name = "itaka.pl"
-
-    def scrape(self) -> list[Offer]:
-        offers = []
-        c = CRITERIA
-
-        url = (
-            "https://www.itaka.pl/wczasy/egipt/marsa-alam/"
-            f"?DepartureDate={c['date_from'].strftime('%d-%m-%Y')}"
-            f"&ReturnDate={c['date_to'].strftime('%d-%m-%Y')}"
-            f"&DurationFrom={c['nights_min']}&DurationTo={c['nights_max']}"
-            f"&Adults={c['adults']}&Children=1&ChildrenAges={c['child_age']}"
-            f"&Attributes%5B%5D=aquapark"
-        )
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(extra_http_headers=HEADERS)
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            sleep_random(3, 5)
-
-            # Scroll żeby załadować lazy-load
-            for _ in range(3):
-                page.evaluate("window.scrollBy(0, 1000)")
-                sleep_random(1, 2)
-
-            html = page.content()
-            browser.close()
-
-        soup = BeautifulSoup(html, "html.parser")
-        cards = (
-            soup.select(".offer-list__item")
-            or soup.select("[data-cy='offer-tile']")
-            or soup.select(".hotel-tile")
-            or soup.select("article[class*='offer']")
-        )
-
-        for card in cards:
-            try:
-                name_el = card.select_one("h2, h3, [class*='title'], [class*='name']")
-                name = name_el.get_text(strip=True) if name_el else "Nieznany hotel"
-
-                price_el = card.select_one("[class*='price'], [data-cy='price']")
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = float("".join(filter(str.isdigit, price_text)) or 0)
-
-                nights_el = card.select_one("[class*='duration'], [class*='night'], [class*='noc']")
-                nights = c["nights_min"]
-                if nights_el:
-                    try:
-                        nights = int("".join(filter(str.isdigit, nights_el.get_text())))
-                    except Exception:
-                        pass
-
-                rating_el = card.select_one("[class*='rating'], [class*='score'], [class*='ocena']")
-                rating = None
-                if rating_el:
-                    try:
-                        rating = float(rating_el.get_text(strip=True).replace(",", "."))
-                    except Exception:
-                        pass
-
-                stars_el = card.select_one("[class*='star'], [class*='category']")
-                stars = None
-                if stars_el:
-                    filled = stars_el.select("[class*='filled'], [class*='active']")
-                    stars = len(filled) if filled else None
-
-                card_text = card.get_text()
-                has_aqua = detect_aquapark(card_text)
-
-                link_el = card.select_one("a[href]")
-                offer_url = link_el["href"] if link_el else url
-                if offer_url.startswith("/"):
-                    offer_url = "https://www.itaka.pl" + offer_url
-
-                board = "AI"
-                for b_key, b_val in [("All Inclusive", "AI"), ("Half Board", "HB"), ("Bed & Breakfast", "BB")]:
-                    if b_key.lower() in card_text.lower():
-                        board = b_val
-                        break
-
-                o = Offer(
-                    source=self.name,
-                    hotel_name=name,
-                    destination="Marsa Alam",
-                    date_from=c["date_from"].strftime("%Y-%m-%d"),
-                    date_to=c["date_to"].strftime("%Y-%m-%d"),
-                    nights=nights,
-                    adults=c["adults"],
-                    children=1,
-                    board=board,
-                    price_total=price,
-                    price_per_person=round(price / (c["adults"] + 1), 2) if price else 0,
-                    rating=rating,
-                    stars=stars,
-                    has_aquapark=has_aqua,
-                    url=offer_url,
+        for dep_date in generate_date_range():
+            for nights in range(CRITERIA["nights_min"], CRITERIA["nights_max"] + 1):
+                api_url = (
+                    "https://www.tui.pl/api/v1/offers/search"
+                    f"?departureDate={dep_date.strftime('%Y-%m-%d')}"
+                    f"&duration={nights}"
+                    f"&adults={CRITERIA['adults']}"
+                    f"&childrenAges={CRITERIA['child_age']}"
+                    f"&destinationCode=EG-RED-MAA"
+                    f"&amenity=aquapark"
+                    f"&minRating={CRITERIA['min_rating']}"
                 )
-                offers.append(o)
-            except Exception as e:
-                log.debug(f"[{self.name}] Błąd karty: {e}")
+                try:
+                    r = session.get(api_url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = data.get("offers", data.get("results", []))
+                        for item in items:
+                            rating = float(item.get("rating", item.get("tripadvisorRating", 0)) or 0)
+                            if rating < CRITERIA["min_rating"]:
+                                continue
+                            price = float(item.get("totalPrice", item.get("price", 0)) or 0)
+                            offers.append(Offer(
+                                hotel=item.get("hotelName", item.get("name", "Nieznany")),
+                                source="tui.pl",
+                                stars=int(item.get("hotelCategory", item.get("stars", 0)) or 0),
+                                rating=rating,
+                                nights=nights,
+                                board=item.get("boardBasis", item.get("board", "?")),
+                                price_total=price,
+                                url="https://www.tui.pl" + item.get("offerUrl", item.get("url", "")),
+                                departure_date=dep_date.strftime("%Y-%m-%d"),
+                            ))
+                except Exception:
+                    pass
+        log.info(f"[tui.pl] Znaleziono {len(offers)} ofert")
+    except Exception as e:
+        log.error(f"[tui.pl] Błąd: {e}")
+    return offers
 
-        return [o for o in offers if o.matches_criteria()]
 
+def scrape_rainbow() -> list[Offer]:
+    """Scraper Rainbow.pl — API JSON."""
+    offers = []
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        session.verify = False
 
-# ─── TUI.pl ───────────────────────────────────────────────────────────────────
-
-class TUIScraper(BaseScraper):
-    name = "tui.pl"
-
-    def scrape(self) -> list[Offer]:
-        offers = []
-        c = CRITERIA
-
-        # TUI ma API JSON — próbujemy je interceptować przez Playwright
-        captured = []
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            def handle_response(response):
-                if "api" in response.url and "offer" in response.url:
-                    try:
-                        data = response.json()
-                        captured.append(data)
-                    except Exception:
-                        pass
-
-            page.on("response", handle_response)
-
-            url = (
-                "https://www.tui.pl/wypoczynek/egipt/marsa-alam/"
-                f"?adults={c['adults']}&children={c['child_age']}"
-                f"&departureDate={c['date_from'].strftime('%Y-%m-%d')}"
-                f"&returnDate={c['date_to'].strftime('%Y-%m-%d')}"
-                f"&duration={c['nights_min']}-{c['nights_max']}"
-                f"&amenities=aquapark"
-            )
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            sleep_random(4, 7)
-
-            # Scroll dla lazy-load
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            sleep_random(2, 3)
-
-            html = page.content()
-            browser.close()
-
-        # Parsujemy HTML fallback
-        soup = BeautifulSoup(html, "html.parser")
-        cards = (
-            soup.select("[class*='OfferCard'], [class*='offer-card'], [data-testid*='offer']")
-            or soup.select("article")
-        )
-
-        for card in cards:
-            try:
-                name_el = card.select_one("h2, h3, [class*='Name'], [class*='title']")
-                if not name_el:
-                    continue
-                name = name_el.get_text(strip=True)
-
-                price_el = card.select_one("[class*='Price'], [class*='price']")
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = float("".join(filter(str.isdigit, price_text)) or 0)
-
-                card_text = card.get_text()
-                has_aqua = detect_aquapark(card_text)
-
-                link_el = card.select_one("a[href]")
-                offer_url = link_el["href"] if link_el else url
-                if offer_url.startswith("/"):
-                    offer_url = "https://www.tui.pl" + offer_url
-
-                rating_el = card.select_one("[class*='Rating'], [class*='rating'], [class*='score']")
-                rating = None
-                if rating_el:
-                    try:
-                        rating = float(rating_el.get_text(strip=True).replace(",", "."))
-                    except Exception:
-                        pass
-
-                o = Offer(
-                    source=self.name,
-                    hotel_name=name,
-                    destination="Marsa Alam",
-                    date_from=c["date_from"].strftime("%Y-%m-%d"),
-                    date_to=c["date_to"].strftime("%Y-%m-%d"),
-                    nights=c["nights_min"],
-                    adults=c["adults"],
-                    children=1,
-                    board="AI",
-                    price_total=price,
-                    price_per_person=round(price / (c["adults"] + 1), 2) if price else 0,
-                    rating=rating,
-                    stars=None,
-                    has_aquapark=has_aqua,
-                    url=offer_url,
+        for dep_date in generate_date_range():
+            for nights in range(CRITERIA["nights_min"], CRITERIA["nights_max"] + 1):
+                api_url = (
+                    "https://www.rainbow.pl/api/offers"
+                    f"?country=egipt&region=marsa-alam"
+                    f"&dateFrom={dep_date.strftime('%d.%m.%Y')}"
+                    f"&duration={nights}"
+                    f"&adults={CRITERIA['adults']}"
+                    f"&children=1&childAge={CRITERIA['child_age']}"
                 )
-                offers.append(o)
-            except Exception as e:
-                log.debug(f"[{self.name}] Błąd karty: {e}")
+                try:
+                    r = session.get(api_url, timeout=15, verify=False)
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = data.get("offers", data.get("results", []))
+                        for item in items:
+                            rating = float(item.get("rating", item.get("score", 0)) or 0)
+                            if rating < CRITERIA["min_rating"]:
+                                continue
+                            attrs = str(item.get("attributes", item.get("amenities", ""))).lower()
+                            if "aqua" not in attrs and "park" not in attrs:
+                                continue
+                            price = float(item.get("price", item.get("totalPrice", 0)) or 0)
+                            if price > 0 and price < 5000:
+                                price *= (CRITERIA["adults"] + 1)
+                            offers.append(Offer(
+                                hotel=item.get("hotelName", item.get("name", "Nieznany")),
+                                source="rainbow.pl",
+                                stars=int(item.get("stars", item.get("category", 0)) or 0),
+                                rating=rating,
+                                nights=nights,
+                                board=item.get("board", item.get("mealType", "?")),
+                                price_total=price,
+                                url="https://www.rainbow.pl" + item.get("url", item.get("offerUrl", "")),
+                                departure_date=dep_date.strftime("%Y-%m-%d"),
+                            ))
+                except Exception:
+                    pass
+        log.info(f"[rainbow.pl] Znaleziono {len(offers)} ofert")
+    except Exception as e:
+        log.error(f"[rainbow.pl] Błąd: {e}")
+    return offers
 
-        return [o for o in offers if o.matches_criteria()]
 
+def scrape_neckermann() -> list[Offer]:
+    """Scraper Neckermann.pl — API JSON."""
+    offers = []
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
 
-# ─── Rainbow.pl ───────────────────────────────────────────────────────────────
-
-class RainbowScraper(BaseScraper):
-    name = "rainbow.pl"
-
-    def scrape(self) -> list[Offer]:
-        offers = []
-        c = CRITERIA
-
-        url = (
-            "https://www.rainbow.pl/wypoczynek/egipt/marsa-alam"
-            f"?dateFrom={c['date_from'].strftime('%Y-%m-%d')}"
-            f"&dateTo={c['date_to'].strftime('%Y-%m-%d')}"
-            f"&adults={c['adults']}&children=1&childAge={c['child_age']}"
-            f"&nightsMin={c['nights_min']}&nightsMax={c['nights_max']}"
-        )
-
-        sess = get_session()
-        resp = sess.get(url, timeout=20)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        cards = soup.select(".offer-item, .hotel-item, article[class*='offer']")
-
-        for card in cards:
-            try:
-                name_el = card.select_one("h2, h3, .name, .title")
-                if not name_el:
-                    continue
-                name = name_el.get_text(strip=True)
-
-                price_el = card.select_one(".price, [class*='price']")
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = float("".join(filter(str.isdigit, price_text)) or 0)
-
-                card_text = card.get_text()
-                has_aqua = detect_aquapark(card_text)
-
-                link_el = card.select_one("a[href]")
-                offer_url = link_el["href"] if link_el else url
-                if offer_url.startswith("/"):
-                    offer_url = "https://www.rainbow.pl" + offer_url
-
-                o = Offer(
-                    source=self.name,
-                    hotel_name=name,
-                    destination="Marsa Alam",
-                    date_from=c["date_from"].strftime("%Y-%m-%d"),
-                    date_to=c["date_to"].strftime("%Y-%m-%d"),
-                    nights=c["nights_min"],
-                    adults=c["adults"],
-                    children=1,
-                    board="AI",
-                    price_total=price,
-                    price_per_person=round(price / (c["adults"] + 1), 2) if price else 0,
-                    rating=None,
-                    stars=None,
-                    has_aquapark=has_aqua,
-                    url=offer_url,
+        for dep_date in generate_date_range():
+            for nights in range(CRITERIA["nights_min"], CRITERIA["nights_max"] + 1):
+                api_url = (
+                    "https://www.neckermann.pl/api/offers/search"
+                    f"?destination=marsa-alam"
+                    f"&departureDate={dep_date.strftime('%Y-%m-%d')}"
+                    f"&nights={nights}"
+                    f"&adults={CRITERIA['adults']}"
+                    f"&childrenAges={CRITERIA['child_age']}"
+                    f"&facilities=aquapark"
+                    f"&minRating={CRITERIA['min_rating']}"
                 )
-                offers.append(o)
-            except Exception as e:
-                log.debug(f"[{self.name}] Błąd: {e}")
+                try:
+                    r = session.get(api_url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = data.get("offers", data.get("results", data.get("data", [])))
+                        for item in items:
+                            rating = float(item.get("rating", item.get("hotelRating", 0)) or 0)
+                            if rating < CRITERIA["min_rating"]:
+                                continue
+                            price = float(item.get("price", item.get("totalPrice", 0)) or 0)
+                            if price > 0 and price < 5000:
+                                price *= (CRITERIA["adults"] + 1)
+                            offers.append(Offer(
+                                hotel=item.get("hotelName", item.get("name", "Nieznany")),
+                                source="neckermann.pl",
+                                stars=int(item.get("stars", item.get("hotelStars", 0)) or 0),
+                                rating=rating,
+                                nights=nights,
+                                board=item.get("board", item.get("boardType", "?")),
+                                price_total=price,
+                                url="https://www.neckermann.pl" + item.get("url", item.get("offerUrl", "")),
+                                departure_date=dep_date.strftime("%Y-%m-%d"),
+                            ))
+                except Exception:
+                    pass
+        log.info(f"[neckermann.pl] Znaleziono {len(offers)} ofert")
+    except Exception as e:
+        log.error(f"[neckermann.pl] Błąd: {e}")
+    return offers
 
-        return [o for o in offers if o.matches_criteria()]
 
+def scrape_coraltravel() -> list[Offer]:
+    """Scraper Coral Travel — API JSON."""
+    offers = []
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
 
-# ─── Coral Travel ─────────────────────────────────────────────────────────────
-
-class CoralTravelScraper(BaseScraper):
-    name = "coral.pl"
-
-    def scrape(self) -> list[Offer]:
-        offers = []
-        c = CRITERIA
-
-        url = (
-            "https://www.coraltravel.pl/oferty/egipt/marsa-alam"
-            f"?from={c['date_from'].strftime('%d.%m.%Y')}"
-            f"&to={c['date_to'].strftime('%d.%m.%Y')}"
-            f"&adults={c['adults']}&children=1&childAge={c['child_age']}"
-            f"&nights={c['nights_min']}-{c['nights_max']}"
-        )
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(extra_http_headers=HEADERS)
-            try:
-                page.goto(url, wait_until="networkidle", timeout=25000)
-                sleep_random(2, 4)
-                html = page.content()
-            except Exception:
-                html = ""
-            browser.close()
-
-        if not html:
-            return []
-
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select(".offer, .hotel-card, [class*='offer-item']")
-
-        for card in cards:
-            try:
-                name_el = card.select_one("h2, h3, .name")
-                if not name_el:
-                    continue
-                name = name_el.get_text(strip=True)
-
-                price_el = card.select_one(".price, [class*='price']")
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = float("".join(filter(str.isdigit, price_text)) or 0)
-
-                card_text = card.get_text()
-                has_aqua = detect_aquapark(card_text)
-
-                link_el = card.select_one("a[href]")
-                offer_url = link_el["href"] if link_el else url
-                if offer_url.startswith("/"):
-                    offer_url = "https://www.coraltravel.pl" + offer_url
-
-                o = Offer(
-                    source=self.name,
-                    hotel_name=name,
-                    destination="Marsa Alam",
-                    date_from=c["date_from"].strftime("%Y-%m-%d"),
-                    date_to=c["date_to"].strftime("%Y-%m-%d"),
-                    nights=c["nights_min"],
-                    adults=c["adults"],
-                    children=1,
-                    board="AI",
-                    price_total=price,
-                    price_per_person=round(price / (c["adults"] + 1), 2) if price else 0,
-                    rating=None,
-                    stars=None,
-                    has_aquapark=has_aqua,
-                    url=offer_url,
+        for dep_date in generate_date_range():
+            for nights in range(CRITERIA["nights_min"], CRITERIA["nights_max"] + 1):
+                api_url = (
+                    "https://www.coraltravel.pl/api/search"
+                    f"?destination=EGMA"
+                    f"&departureDate={dep_date.strftime('%Y-%m-%d')}"
+                    f"&nights={nights}"
+                    f"&adults={CRITERIA['adults']}"
+                    f"&children=1&childAge={CRITERIA['child_age']}"
                 )
-                offers.append(o)
-            except Exception as e:
-                log.debug(f"[{self.name}] Błąd: {e}")
+                try:
+                    r = session.get(api_url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = data.get("offers", data.get("hotels", []))
+                        for item in items:
+                            rating = float(item.get("rating", item.get("score", 0)) or 0)
+                            if rating < CRITERIA["min_rating"]:
+                                continue
+                            attrs = str(item.get("amenities", item.get("services", ""))).lower()
+                            if "aqua" not in attrs:
+                                continue
+                            price = float(item.get("price", item.get("totalPrice", 0)) or 0)
+                            if price > 0 and price < 5000:
+                                price *= (CRITERIA["adults"] + 1)
+                            offers.append(Offer(
+                                hotel=item.get("hotelName", item.get("name", "Nieznany")),
+                                source="coraltravel.pl",
+                                stars=int(item.get("stars", item.get("category", 0)) or 0),
+                                rating=rating,
+                                nights=nights,
+                                board=item.get("board", item.get("mealType", "?")),
+                                price_total=price,
+                                url="https://www.coraltravel.pl" + item.get("url", item.get("offerUrl", "")),
+                                departure_date=dep_date.strftime("%Y-%m-%d"),
+                            ))
+                except Exception:
+                    pass
+        log.info(f"[coraltravel.pl] Znaleziono {len(offers)} ofert")
+    except Exception as e:
+        log.error(f"[coraltravel.pl] Błąd: {e}")
+    return offers
 
-        return [o for o in offers if o.matches_criteria()]
-
-
-# ─── Neckermann.pl ────────────────────────────────────────────────────────────
-
-class NeckermannScraper(BaseScraper):
-    name = "neckermann.pl"
-
-    def scrape(self) -> list[Offer]:
-        offers = []
-        c = CRITERIA
-
-        url = (
-            "https://www.neckermann.pl/oferty/egipt/marsa-alam/"
-            f"?dateFrom={c['date_from'].strftime('%Y-%m-%d')}"
-            f"&dateTo={c['date_to'].strftime('%Y-%m-%d')}"
-            f"&adults={c['adults']}&child1={c['child_age']}"
-            f"&nights={c['nights_min']},{c['nights_max']}"
-            f"&attributes=aquapark"
-        )
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(extra_http_headers=HEADERS)
-            try:
-                page.goto(url, wait_until="networkidle", timeout=25000)
-                sleep_random(3, 5)
-                html = page.content()
-            except Exception:
-                html = ""
-            browser.close()
-
-        if not html:
-            return []
-
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select(".offer-tile, .offer-card, [data-offer], article")
-
-        for card in cards:
-            try:
-                name_el = card.select_one("h2, h3, .hotel-name, [class*='name']")
-                if not name_el:
-                    continue
-                name = name_el.get_text(strip=True)
-
-                price_el = card.select_one(".price, [class*='price'], [class*='koszt']")
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = float("".join(filter(str.isdigit, price_text)) or 0)
-
-                card_text = card.get_text()
-                has_aqua = detect_aquapark(card_text)
-
-                link_el = card.select_one("a[href]")
-                offer_url = link_el["href"] if link_el else url
-                if offer_url.startswith("/"):
-                    offer_url = "https://www.neckermann.pl" + offer_url
-
-                o = Offer(
-                    source=self.name,
-                    hotel_name=name,
-                    destination="Marsa Alam",
-                    date_from=c["date_from"].strftime("%Y-%m-%d"),
-                    date_to=c["date_to"].strftime("%Y-%m-%d"),
-                    nights=c["nights_min"],
-                    adults=c["adults"],
-                    children=1,
-                    board="AI",
-                    price_total=price,
-                    price_per_person=round(price / (c["adults"] + 1), 2) if price else 0,
-                    rating=None,
-                    stars=None,
-                    has_aquapark=has_aqua,
-                    url=offer_url,
-                )
-                offers.append(o)
-            except Exception as e:
-                log.debug(f"[{self.name}] Błąd: {e}")
-
-        return [o for o in offers if o.matches_criteria()]
-
-
-# ─── Główna funkcja ───────────────────────────────────────────────────────────
 
 def run_all_scrapers() -> list[Offer]:
-    scrapers = [
-        WakacjePLScraper(),
-        ItakaScraper(),
-        TUIScraper(),
-        RainbowScraper(),
-        CoralTravelScraper(),
-        NeckermannScraper(),
-    ]
-
+    """Uruchamia wszystkie scrapery i zwraca połączone wyniki."""
     all_offers = []
+    scrapers = [
+        scrape_wakacje_pl,
+        scrape_itaka,
+        scrape_tui,
+        scrape_rainbow,
+        scrape_neckermann,
+        scrape_coraltravel,
+    ]
     for scraper in scrapers:
-        offers = scraper.safe_scrape()
-        all_offers.extend(offers)
-        sleep_random(3, 6)  # przerwa między serwisami
+        try:
+            results = scraper()
+            all_offers.extend(results)
+        except Exception as e:
+            log.error(f"Błąd scrapera {scraper.__name__}: {e}")
 
-    # Deduplicacja po kluczu (ten sam hotel + data + cena)
+    # Deduplikacja po kluczu
     seen = set()
     unique = []
-    for o in all_offers:
-        k = o.unique_key()
+    for offer in all_offers:
+        k = offer.key()
         if k not in seen:
             seen.add(k)
-            unique.append(o)
+            unique.append(offer)
 
-    # Sortowanie: najpierw ocena, potem cena
-    unique.sort(key=lambda x: (-(x.rating or 0), x.price_total))
+    log.info(f"Łącznie unikalnych ofert: {len(unique)}")
     return unique
-
-
-if __name__ == "__main__":
-    offers = run_all_scrapers()
-    print(f"\n=== Znaleziono {len(offers)} unikalnych ofert ===\n")
-    for o in offers:
-        print(f"{o.source} | {o.hotel_name} | {o.nights}n | {o.board} | {o.price_total:.0f} zł | ocena: {o.rating}")
