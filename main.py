@@ -27,7 +27,7 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 # ── importy projektu ──────────────────────────────────────────────────────────
-from scrapers.scraper import scrape_all
+from scrapers.scraper import run_all_scrapers as scrape_all
 from notifier.notify import notify
 
 # ── stan (poprzednie oferty) ──────────────────────────────────────────────────
