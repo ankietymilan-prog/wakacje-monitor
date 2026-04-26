@@ -336,3 +336,4 @@ async def scrape_all_async() -> list[Offer]:
 def run_all_scrapers() -> list[Offer]:
     """Synchroniczny wrapper dla async scraperów."""
     return asyncio.run(scrape_all_async())
+    pythonscrape_all = run_all_scrapers
