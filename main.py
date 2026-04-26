@@ -12,7 +12,7 @@ from dataclasses import asdict
 
 # Dodaj katalog główny do path
 sys.path.insert(0, str(Path(__file__).parent))
-
+os.makedirs("data", exist_ok=True)
 from scrapers.scraper import run_all_scrapers, Offer
 from notifier.notify import notify
 
