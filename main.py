@@ -1,114 +1,118 @@
 """
-Główny runner — porównuje z poprzednim stanem, wykrywa nowe oferty
-Uruchamiany przez GitHub Actions co godzinę
+Wakacje Monitor — główny skrypt
+Sprawdza travelplanet.pl co godzinę i wysyła powiadomienia.
 """
 
-import json
-import logging
 import os
 import sys
+import json
+import logging
 from pathlib import Path
-from dataclasses import asdict
+from datetime import datetime
 
-# Dodaj katalog główny do path
-sys.path.insert(0, str(Path(__file__).parent))
-os.makedirs("data", exist_ok=True)
-from scrapers.scraper import run_all_scrapers, Offer
-from notifier.notify import notify
+# ── ścieżki ──────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+os.makedirs(ROOT / "data", exist_ok=True)
 
+# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("data/monitor.log", encoding="utf-8"),
-    ]
+        logging.FileHandler(ROOT / "data" / "monitor.log", encoding="utf-8"),
+    ],
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("main")
 
-STATE_FILE = Path("data/last_offers.json")
+# ── importy projektu ──────────────────────────────────────────────────────────
+from scrapers.scraper import scrape_all
+from notifier.notify import notify
+
+# ── stan (poprzednie oferty) ──────────────────────────────────────────────────
+STATE_FILE = ROOT / "data" / "last_offers.json"
+HISTORY_FILE = ROOT / "data" / "offers_history.csv"
 
 
-def load_previous_state() -> set[str]:
-    """Wczytuje klucze poprzednich ofert."""
+def load_previous_keys() -> set:
     if not STATE_FILE.exists():
         return set()
     try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return set(data.get("keys", []))
-    except Exception as e:
-        log.warning(f"Błąd wczytywania stanu: {e}")
+    except Exception:
         return set()
 
 
-def save_state(offers: list[Offer]):
-    """Zapisuje aktualny stan."""
-    STATE_FILE.parent.mkdir(exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "keys": [o.unique_key() for o in offers],
-            "offers": [asdict(o) for o in offers],
-            "updated_at": __import__("datetime").datetime.now().isoformat(),
-            "count": len(offers),
-        }, f, ensure_ascii=False, indent=2)
-    log.info(f"Stan zapisany: {len(offers)} ofert → {STATE_FILE}")
+def save_state(offers):
+    keys = [o.key() for o in offers]
+    STATE_FILE.write_text(
+        json.dumps({"keys": keys, "updated": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
-def save_offers_csv(offers: list[Offer]):
-    """Eksportuje oferty do CSV (przydatne do śledzenia historii)."""
-    import csv
-    from datetime import datetime
-
-    csv_path = Path("data/offers_history.csv")
-    file_exists = csv_path.exists()
-
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "scraped_at", "source", "hotel_name", "nights",
-                "board", "price_total", "price_per_person", "rating", "stars", "url"
-            ])
+def append_history(offers):
+    write_header = not HISTORY_FILE.exists()
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write("timestamp,source,hotel,stars,rating,nights,board,price_total,url\n")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         for o in offers:
-            writer.writerow([
-                o.scraped_at, o.source, o.hotel_name, o.nights,
-                o.board, o.price_total, o.price_per_person,
-                o.rating, o.stars, o.url
+            row = ",".join([
+                ts,
+                o.source,
+                f'"{o.hotel}"',
+                str(o.stars or ""),
+                str(o.rating or ""),
+                str(o.nights or ""),
+                o.board or "",
+                str(int(o.price_total)) if o.price_total else "",
+                o.url,
             ])
+            f.write(row + "\n")
 
+
+# ── główna logika ─────────────────────────────────────────────────────────────
 
 def main():
     log.info("=" * 60)
-    log.info("WAKACJE MONITOR — START")
+    log.info(f"Start monitoringu: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     log.info("=" * 60)
 
-    # 1. Pobierz poprzedni stan
-    previous_keys = load_previous_state()
-    log.info(f"Poprzedni stan: {len(previous_keys)} ofert")
+    # Pobierz oferty (tylko travelplanet)
+    current_offers = scrape_all()
+    log.info(f"Łącznie znaleziono: {len(current_offers)} ofert")
 
-    # 2. Scraping wszystkich serwisów
-    current_offers = run_all_scrapers()
-    log.info(f"Aktualnie znaleziono: {len(current_offers)} ofert spełniających kryteria")
+    if not current_offers:
+        log.warning("Brak ofert — kończę bez powiadomień")
+        return
 
-    # 3. Wykryj nowe oferty
-    new_offers = [o for o in current_offers if o.key() not in previous_keys]
-    log.info(f"Nowych ofert: {len(new_offers)}")
+    # Wypisz oferty w logach
+    for o in sorted(current_offers, key=lambda x: x.price_total or 9_999_999):
+        log.info(f"  {o.hotel} | {o.source} | {o.nights}n | {o.price_total:.0f} zł")
 
-    if new_offers:
-        log.info("Nowe oferty:")
-        for o in new_offers:
-            log.info(f"  + {o.hotel} | {o.source} | {o.nights}n | {o.price_total:.0f} zł")
+    # Znajdź nowe oferty
+    previous_keys = load_previous_keys()
+    new_keys = {o.key() for o in current_offers} - previous_keys
+    log.info(f"Nowych ofert: {len(new_keys)} (poprzednio: {len(previous_keys)})")
 
-    # 4. Powiadomienia
-    notify(new_offers, current_offers)
+    # Czy wysłać powiadomienie?
+    hour = datetime.now().hour
+    is_daily_report = (hour == 8)  # raport dzienny o 8:00
 
-    # 5. Zapisz aktualny stan
+    if new_keys or is_daily_report:
+        log.info("Wysyłam powiadomienia...")
+        notify(current_offers, new_keys)
+    else:
+        log.info("Brak nowych ofert, pomijam powiadomienia")
+
+    # Zapisz stan i historię
     save_state(current_offers)
-    save_offers_csv(current_offers)
-
-    log.info("KONIEC — do następnego uruchomienia!")
-    return len(current_offers)
+    append_history(current_offers)
+    log.info("Stan i historia zapisane")
+    log.info("Koniec monitoringu")
 
 
 if __name__ == "__main__":
