@@ -92,7 +92,7 @@ def main():
     log.info(f"Aktualnie znaleziono: {len(current_offers)} ofert spełniających kryteria")
 
     # 3. Wykryj nowe oferty
-    new_offers = [o for o in current_offers if o.unique_key() not in previous_keys]
+    new_offers = [o for o in current_offers if o.key() not in previous_keys]
     log.info(f"Nowych ofert: {len(new_offers)}")
 
     if new_offers:
