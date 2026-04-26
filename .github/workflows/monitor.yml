@@ -41,18 +41,22 @@ jobs:
           EMAIL_APP_PASS: ${{ secrets.EMAIL_APP_PASS }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+        run: |
+          mkdir -p data
+          python main.py
 
       - name: Save offers state
         uses: actions/cache@v4
+        if: always()
         with:
           path: data/
-          key: offers-state-${{ runner.os }}
+          key: offers-state-${{ runner.os }}-${{ github.run_id }}
 
       - name: Commit history CSV
+        if: always()
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add -A data/ || true
+          git config user.name "Wakacje Bot"
+          git config user.email "bot@wakacje-monitor"
+          git add data/offers_history.csv data/last_offers.json || true
           git diff --staged --quiet || git commit -m "Update offers history [skip ci]"
           git push || true
