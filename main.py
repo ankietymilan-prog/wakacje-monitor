@@ -98,7 +98,7 @@ def main():
     if new_offers:
         log.info("Nowe oferty:")
         for o in new_offers:
-            log.info(f"  + {o.hotel_name} | {o.source} | {o.nights}n | {o.price_total:.0f} zł")
+            log.info(f"  + {o.hotel} | {o.source} | {o.nights}n | {o.price_total:.0f} zł")
 
     # 4. Powiadomienia
     notify(new_offers, current_offers)
