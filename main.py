@@ -100,7 +100,7 @@ def main():
 
     # Czy wysłać powiadomienie?
     hour = datetime.now().hour
-    is_daily_report = (hour == 8)  # raport dzienny o 8:00
+    is_daily_report = hour in [8, 18]
 
     if new_keys or is_daily_report:
         log.info("Wysyłam powiadomienia...")
